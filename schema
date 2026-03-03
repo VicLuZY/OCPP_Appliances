@@ -1,0 +1,1710 @@
+# Home OCPP Appliance Gateway (CSMS) with Nested Virtual Groups + Load Dashboard
+
+This document is a single, end-to-end build guide for a **home OCPP Central System (CSMS)** that manages **240V appliances** as “charge points,” with:
+
+- **OCPP 1.6J (JSON) over WebSockets** for appliance connectivity
+- **FastAPI** REST API + **built-in web UI**
+- **Per-appliance power caps (W)**
+- **Nested virtual groups** (groups can contain appliances and other groups; no cycles)
+- **Effective cap resolution**: `effective_cap = min(individual_cap, all ancestor group caps)`
+- **Dashboard** showing:
+  - total instantaneous load (sum of connected appliances)
+  - per-appliance instantaneous watts
+  - per-group aggregate load (including nested membership)
+  - optional headroom against a configurable service limit
+  - a small in-memory load history chart
+
+---
+
+## Recommended codebase
+
+### Best fit for a home gateway prototype (this repo)
+**Python + FastAPI + `ocpp` (mobilityhouse)** is the most appropriate codebase here because it:
+- ships quickly (minimal boilerplate)
+- is easy to iterate on policies (groups, limits, scheduling)
+- has a mature OCPP 1.6 Python library
+- makes it trivial to serve a local UI and API from one process
+
+### When to choose something else
+- If you need a production-grade, multi-tenant backend: consider a full CSMS platform or a Java codebase like SteVe, plus a proper frontend stack.
+- If you want tight integration with an existing home automation ecosystem: consider adding adapters rather than replacing it.
+
+This project is intentionally **local-first** and **home-scale**.
+
+---
+
+## Safety disclaimer (important)
+This server is a **policy and messaging plane**, not the only safety layer.
+
+Any appliance controller (native or retrofit) must enforce:
+- electrical and thermal limits
+- minimum on/off times (especially compressors)
+- manufacturer safety interlocks
+- safe handling of stop and cap requests (pause/throttle instead of hard cut where needed)
+
+For retrofit contactor designs: use appropriately rated components, enclosures, and compliant wiring practices.
+
+---
+
+## Quick start
+
+### Prereqs
+- Python 3.10+
+- A Linux/macOS/Windows machine (mini PC, NAS, Raspberry Pi-class)
+- Appliances/controllers that can connect as OCPP 1.6J clients (or simulators)
+
+### Install + run
+```bash
+mkdir home-ocpp-appliances
+cd home-ocpp-appliances
+# add files per the sections below, then:
+pip install -e .
+uvicorn app.main:app --host 0.0.0.0 --port 9000
+
+Project structure
+home-ocpp-appliances/
+  pyproject.toml
+  app/
+    __init__.py
+    main.py
+    csms.py
+    models.py
+    state.py
+    groups.py
+    metering.py
+    dashboard.py
+    static/
+      index.html
+File: pyproject.toml
+[project]
+name = "home-ocpp-appliances"
+version = "0.2.0"
+description = "Home OCPP CSMS for managing appliances with limits, nested groups, and load dashboard"
+requires-python = ">=3.10"
+dependencies = [
+  "fastapi>=0.110",
+  "uvicorn[standard]>=0.27",
+  "ocpp>=0.26.0",
+  "pydantic>=2.5",
+]
+
+[tool.uvicorn]
+factory = false
+File: app/__init__.py
+# empty on purpose
+File: app/models.py
+from __future__ import annotations
+
+from enum import Enum
+from pydantic import BaseModel, Field
+from typing import Any, Dict, List, Optional, Set
+
+
+class ApplianceKind(str, Enum):
+    EVSE = "evse"
+    WATER_HEATER = "water_heater"
+    DRYER = "dryer"
+    RANGE = "range"
+    OVEN = "oven"
+    HEAT_PUMP = "heat_pump"
+    AIR_CONDITIONER = "air_conditioner"
+    OTHER_240V = "other_240v"
+
+
+class ApplianceInfo(BaseModel):
+    cp_id: str
+    kind: ApplianceKind = ApplianceKind.OTHER_240V
+    description: Optional[str] = None
+    rated_watts: Optional[int] = None
+    connectors: int = 1
+
+
+class ApplianceStatus(BaseModel):
+    cp_id: str
+    connected: bool
+    last_heartbeat_ts: Optional[float] = None
+    last_status: Optional[str] = None
+    last_error: Optional[str] = None
+    last_meter: Dict[str, Any] = Field(default_factory=dict)
+    active_transaction_id: Optional[int] = None
+    tags: Dict[str, str] = Field(default_factory=dict)
+
+    # Home gateway policy knobs
+    individual_limit_watts: Optional[int] = None
+
+
+class RemoteStartRequest(BaseModel):
+    id_tag: str = "HOME"
+    connector_id: int = 1
+
+
+class RemoteStopRequest(BaseModel):
+    transaction_id: int
+
+
+class LoadLevelControlRequest(BaseModel):
+    # Sent as DataTransfer vendor extension
+    command: str = Field(default="SET", description="SET|INCREASE|DECREASE")
+    target_load_kw: float = 0.0
+    duration_minutes: int = 0
+    reason: str = "Home Load Management"
+    transaction_id: Optional[int] = None
+
+
+class ChargingRateUnitChangeRequest(BaseModel):
+    # Sent as DataTransfer vendor extension
+    desired_unit: str = Field(default="A", description="A|kW")
+    reason: str = "Home Demand Response"
+    effective_time: Optional[str] = None
+    transaction_id: Optional[int] = None
+
+
+class SimpleChargingProfile(BaseModel):
+    """
+    Minimal profile for home caps using SetChargingProfile (OCPP 1.6).
+    We use W as the canonical unit for appliance caps.
+    """
+    connector_id: int = 1
+    transaction_id: Optional[int] = None
+    unit: str = "W"     # "W" only for now
+    limit: float = 0.0  # watts
+    duration_seconds: Optional[int] = None
+
+
+class DataTransferRequest(BaseModel):
+    vendor_id: str
+    message_id: str
+    data: Dict[str, Any]
+
+
+class GroupCreate(BaseModel):
+    group_id: str
+    name: str
+    limit_watts: Optional[int] = None
+
+
+class GroupUpdate(BaseModel):
+    name: Optional[str] = None
+    limit_watts: Optional[int] = None
+
+
+class GroupView(BaseModel):
+    group_id: str
+    name: str
+    limit_watts: Optional[int] = None
+    appliances: Set[str] = Field(default_factory=set)
+    subgroups: Set[str] = Field(default_factory=set)
+
+
+class GroupMemberAppliance(BaseModel):
+    cp_id: str
+
+
+class GroupMemberGroup(BaseModel):
+    child_group_id: str
+
+
+class ApplianceLimitUpdate(BaseModel):
+    limit_watts: Optional[int] = None
+
+
+class EffectiveCapsResponse(BaseModel):
+    caps: Dict[str, Optional[int]]
+    reasons: Dict[str, Dict[str, Any]]
+File: app/state.py
+from __future__ import annotations
+
+import asyncio
+import time
+from dataclasses import dataclass, field
+from typing import Any, Dict, Optional
+
+from app.models import ApplianceInfo, ApplianceStatus
+
+
+@dataclass
+class ConnectedCP:
+    cp_id: str
+    charge_point: Any
+    info: ApplianceInfo = field(default_factory=lambda: ApplianceInfo(cp_id=""))
+    status: ApplianceStatus = field(default_factory=lambda: ApplianceStatus(cp_id="", connected=True))
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+
+class Registry:
+    """
+    In-memory registry. Swap to SQLite/Redis for persistence.
+    """
+    def __init__(self) -> None:
+        self._cps: Dict[str, ConnectedCP] = {}
+
+    def upsert(self, cp_id: str, charge_point: Any) -> ConnectedCP:
+        if cp_id not in self._cps:
+            info = ApplianceInfo(cp_id=cp_id)
+            status = ApplianceStatus(cp_id=cp_id, connected=True, last_heartbeat_ts=time.time())
+            self._cps[cp_id] = ConnectedCP(cp_id=cp_id, charge_point=charge_point, info=info, status=status)
+        else:
+            self._cps[cp_id].charge_point = charge_point
+            self._cps[cp_id].status.connected = True
+            self._cps[cp_id].status.last_heartbeat_ts = time.time()
+        return self._cps[cp_id]
+
+    def mark_disconnected(self, cp_id: str) -> None:
+        cp = self._cps.get(cp_id)
+        if cp:
+            cp.status.connected = False
+
+    def get(self, cp_id: str) -> Optional[ConnectedCP]:
+        return self._cps.get(cp_id)
+
+    def list_status(self) -> Dict[str, ApplianceStatus]:
+        return {cp_id: cp.status for cp_id, cp in self._cps.items()}
+
+    def list_info(self) -> Dict[str, ApplianceInfo]:
+        return {cp_id: cp.info for cp_id, cp in self._cps.items()}
+
+
+REGISTRY = Registry()
+File: app/groups.py
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Dict, Optional, Set
+
+
+@dataclass
+class Group:
+    group_id: str
+    name: str
+    limit_watts: Optional[int] = None
+    appliances: Set[str] = field(default_factory=set)  # cp_ids
+    subgroups: Set[str] = field(default_factory=set)   # group_ids
+
+
+class GroupRegistry:
+    """
+    In-memory directed acyclic graph (DAG) of groups.
+    Supports nested groups. Prevents cycles.
+    """
+    def __init__(self) -> None:
+        self._groups: Dict[str, Group] = {}
+        self._parents: Dict[str, Set[str]] = {}          # child_group_id -> parents
+        self._appliance_groups: Dict[str, Set[str]] = {} # cp_id -> direct groups
+
+    def list_groups(self) -> Dict[str, Group]:
+        return self._groups
+
+    def get_group(self, group_id: str) -> Optional[Group]:
+        return self._groups.get(group_id)
+
+    def create_group(self, group_id: str, name: str, limit_watts: Optional[int] = None) -> Group:
+        if group_id in self._groups:
+            raise ValueError("group already exists")
+        g = Group(group_id=group_id, name=name, limit_watts=limit_watts)
+        self._groups[group_id] = g
+        self._parents.setdefault(group_id, set())
+        return g
+
+    def delete_group(self, group_id: str) -> None:
+        g = self._groups.get(group_id)
+        if not g:
+            return
+
+        # unlink from parents
+        for parent in list(self._parents.get(group_id, set())):
+            pg = self._groups.get(parent)
+            if pg:
+                pg.subgroups.discard(group_id)
+        self._parents.pop(group_id, None)
+
+        # unlink children
+        for child in list(g.subgroups):
+            self._parents.get(child, set()).discard(group_id)
+
+        # unlink appliances reverse index
+        for cp_id in list(g.appliances):
+            self._appliance_groups.get(cp_id, set()).discard(group_id)
+
+        self._groups.pop(group_id, None)
+
+    def set_group_limit(self, group_id: str, limit_watts: Optional[int]) -> Group:
+        g = self._require_group(group_id)
+        g.limit_watts = limit_watts
+        return g
+
+    def add_appliance(self, group_id: str, cp_id: str) -> Group:
+        g = self._require_group(group_id)
+        g.appliances.add(cp_id)
+        self._appliance_groups.setdefault(cp_id, set()).add(group_id)
+        return g
+
+    def remove_appliance(self, group_id: str, cp_id: str) -> Group:
+        g = self._require_group(group_id)
+        g.appliances.discard(cp_id)
+        self._appliance_groups.get(cp_id, set()).discard(group_id)
+        return g
+
+    def add_subgroup(self, parent_group_id: str, child_group_id: str) -> Group:
+        parent = self._require_group(parent_group_id)
+        self._require_group(child_group_id)
+
+        if parent_group_id == child_group_id:
+            raise ValueError("cannot add group as subgroup of itself")
+
+        # cycle check: parent must not be reachable from child
+        if self._reachable(child_group_id, parent_group_id):
+            raise ValueError("would create cycle")
+
+        parent.subgroups.add(child_group_id)
+        self._parents.setdefault(child_group_id, set()).add(parent_group_id)
+        return parent
+
+    def remove_subgroup(self, parent_group_id: str, child_group_id: str) -> Group:
+        parent = self._require_group(parent_group_id)
+        parent.subgroups.discard(child_group_id)
+        self._parents.get(child_group_id, set()).discard(parent_group_id)
+        return parent
+
+    def appliance_groups(self, cp_id: str) -> Set[str]:
+        return set(self._appliance_groups.get(cp_id, set()))
+
+    def ancestors_of_group(self, group_id: str) -> Set[str]:
+        visited: Set[str] = set()
+        stack = list(self._parents.get(group_id, set()))
+        while stack:
+            p = stack.pop()
+            if p in visited:
+                continue
+            visited.add(p)
+            stack.extend(list(self._parents.get(p, set())))
+        return visited
+
+    def ancestors_of_appliance(self, cp_id: str) -> Set[str]:
+        direct = self._appliance_groups.get(cp_id, set())
+        all_groups: Set[str] = set(direct)
+        for g in list(direct):
+            all_groups |= self.ancestors_of_group(g)
+        return all_groups
+
+    def _require_group(self, group_id: str) -> Group:
+        g = self._groups.get(group_id)
+        if not g:
+            raise ValueError("group not found")
+        return g
+
+    def _reachable(self, start_group_id: str, target_group_id: str) -> bool:
+        visited: Set[str] = set()
+        stack = [start_group_id]
+        while stack:
+            cur = stack.pop()
+            if cur == target_group_id:
+                return True
+            if cur in visited:
+                continue
+            visited.add(cur)
+            g = self._groups.get(cur)
+            if not g:
+                continue
+            stack.extend(list(g.subgroups))
+        return False
+
+
+GROUPS = GroupRegistry()
+File: app/metering.py
+from __future__ import annotations
+
+from typing import Any, Dict, Optional
+
+
+def _safe_float(x: Any) -> Optional[float]:
+    try:
+        return float(x)
+    except Exception:
+        return None
+
+
+def parse_ocpp16_meter_values(last_meter: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Extract a usable snapshot from the last stored MeterValues payload.
+    Attempts to read:
+      - instant_w from Power.Active.Import (W or kW)
+      - energy_kwh from Energy.Active.Import.Register (Wh or kWh)
+      - timestamp from latest meter entry
+
+    Many devices vary in exact field casing; this parser is intentionally tolerant.
+    """
+    mv = last_meter.get("meter_value")
+    if not mv or not isinstance(mv, list):
+        return {"instant_w": None, "energy_kwh": None, "timestamp": None}
+
+    best_ts = None
+    instant_w = None
+    energy_kwh = None
+
+    def consider_ts(ts: Optional[str]) -> None:
+        nonlocal best_ts
+        if not ts:
+            return
+        if best_ts is None or ts > best_ts:
+            best_ts = ts
+
+    for entry in mv:
+        if not isinstance(entry, dict):
+            continue
+        ts = entry.get("timestamp") or entry.get("timeStamp")
+        consider_ts(ts)
+
+        sampled = entry.get("sampledValue") or entry.get("sampled_value") or []
+        if not isinstance(sampled, list):
+            continue
+
+        for sv in sampled:
+            if not isinstance(sv, dict):
+                continue
+
+            meas = (sv.get("measurand") or "").lower()
+            unit = (sv.get("unit") or "").lower()
+            value = _safe_float(sv.get("value"))
+            if value is None:
+                continue
+
+            # Instantaneous power
+            if "power.active.import" in meas or meas == "power.active.import":
+                if unit == "kw":
+                    value *= 1000.0
+                instant_w = value if instant_w is None else instant_w
+                continue
+
+            if (meas == "power" or "power.active" in meas) and instant_w is None:
+                if unit == "kw":
+                    value *= 1000.0
+                instant_w = value
+                continue
+
+            # Cumulative energy
+            if "energy.active.import.register" in meas or meas == "energy.active.import.register":
+                if unit == "wh":
+                    energy_kwh = value / 1000.0
+                elif unit == "kwh":
+                    energy_kwh = value
+                else:
+                    energy_kwh = (value / 1000.0) if value > 1000 else value
+                continue
+
+    return {"instant_w": instant_w, "energy_kwh": energy_kwh, "timestamp": best_ts}
+File: app/dashboard.py
+from __future__ import annotations
+
+import time
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Set, Tuple
+
+from app.state import REGISTRY
+from app.groups import GROUPS
+from app.metering import parse_ocpp16_meter_values
+
+
+@dataclass
+class DashboardHistory:
+    max_points: int = 300
+    points: List[Dict[str, Any]] = field(default_factory=list)
+
+    def push(self, t: float, total_w: float) -> None:
+        self.points.append({"t": t, "total_w": total_w})
+        if len(self.points) > self.max_points:
+            self.points = self.points[-self.max_points:]
+
+
+DASH_HISTORY = DashboardHistory()
+
+
+def effective_caps() -> Tuple[Dict[str, Optional[int]], Dict[str, Dict[str, Any]]]:
+    statuses = REGISTRY.list_status()
+    caps: Dict[str, Optional[int]] = {}
+    reasons: Dict[str, Dict[str, Any]] = {}
+
+    for cp_id, st in statuses.items():
+        candidate_caps: List[Tuple[str, int]] = []
+        if st.individual_limit_watts is not None:
+            candidate_caps.append(("individual", int(st.individual_limit_watts)))
+
+        for gid in sorted(GROUPS.ancestors_of_appliance(cp_id)):
+            g = GROUPS.get_group(gid)
+            if g and g.limit_watts is not None:
+                candidate_caps.append((f"group:{gid}", int(g.limit_watts)))
+
+        caps[cp_id] = min((v for _, v in candidate_caps), default=None)
+        reasons[cp_id] = {"candidates": [{"source": s, "watts": v} for s, v in candidate_caps]}
+
+    return caps, reasons
+
+
+def _group_descendants(group_id: str) -> Set[str]:
+    visited: Set[str] = set()
+    stack = [group_id]
+    while stack:
+        cur = stack.pop()
+        if cur in visited:
+            continue
+        visited.add(cur)
+        g = GROUPS.get_group(cur)
+        if not g:
+            continue
+        stack.extend(list(g.subgroups))
+    visited.discard(group_id)
+    return visited
+
+
+def _group_all_appliances(group_id: str) -> Set[str]:
+    g = GROUPS.get_group(group_id)
+    if not g:
+        return set()
+    aps = set(g.appliances)
+    for desc in _group_descendants(group_id):
+        dg = GROUPS.get_group(desc)
+        if dg:
+            aps |= set(dg.appliances)
+    return aps
+
+
+def build_dashboard(service_limit_w: Optional[int] = None) -> Dict[str, Any]:
+    statuses = REGISTRY.list_status()
+    caps, _ = effective_caps()
+
+    appliances: Dict[str, Any] = {}
+    total_w = 0.0
+    connected = 0
+
+    for cp_id, st in statuses.items():
+        parsed = parse_ocpp16_meter_values(st.last_meter)
+        w = parsed["instant_w"] or 0.0
+
+        if st.connected:
+            connected += 1
+            total_w += float(w)
+
+        appliances[cp_id] = {
+            "cp_id": cp_id,
+            "connected": st.connected,
+            "last_heartbeat_ts": st.last_heartbeat_ts,
+            "last_status": st.last_status,
+            "last_error": st.last_error,
+            "instant_w": parsed["instant_w"],
+            "energy_kwh": parsed["energy_kwh"],
+            "meter_ts": parsed["timestamp"],
+            "individual_limit_watts": st.individual_limit_watts,
+            "effective_limit_watts": caps.get(cp_id),
+            "direct_groups": sorted(list(GROUPS.appliance_groups(cp_id))),
+        }
+
+    groups: Dict[str, Any] = {}
+    for gid, g in GROUPS.list_groups().items():
+        member_aps = _group_all_appliances(gid)
+        group_w = 0.0
+        for cp_id in member_aps:
+            ap = appliances.get(cp_id)
+            if ap and ap["connected"] and ap["instant_w"] is not None:
+                group_w += float(ap["instant_w"])
+        groups[gid] = {
+            "group_id": gid,
+            "name": g.name,
+            "limit_watts": g.limit_watts,
+            "instant_w_sum": group_w,
+            "appliances_total": len(member_aps),
+            "appliances_connected": sum(1 for cp in member_aps if appliances.get(cp, {}).get("connected")),
+            "direct_appliances": sorted(list(g.appliances)),
+            "direct_subgroups": sorted(list(g.subgroups)),
+        }
+
+    headroom_w = None
+    if service_limit_w is not None:
+        headroom_w = float(service_limit_w) - float(total_w)
+
+    DASH_HISTORY.push(time.time(), float(total_w))
+
+    return {
+        "totals": {
+            "total_instant_w": total_w,
+            "connected_appliances": connected,
+            "known_appliances": len(statuses),
+            "service_limit_w": service_limit_w,
+            "headroom_w": headroom_w,
+        },
+        "appliances": appliances,
+        "groups": groups,
+        "history": DASH_HISTORY.points,
+    }
+File: app/csms.py
+from __future__ import annotations
+
+import json
+import time
+from typing import Any, Dict, Optional
+
+from ocpp.routing import on
+from ocpp.v16 import ChargePoint as ChargePointV16
+from ocpp.v16 import call, call_result
+from ocpp.v16.enums import Action, RegistrationStatus, AuthorizationStatus
+
+from app.state import REGISTRY
+
+
+class ApplianceChargePoint(ChargePointV16):
+    """
+    OCPP 1.6J charge point session.
+    Each appliance controller connects as its own charge point (cp_id).
+    """
+
+    async def on_connect_init(self) -> None:
+        REGISTRY.upsert(self.id, self)
+
+    @on(Action.BootNotification)
+    async def on_boot_notification(self, charge_point_model: str, charge_point_vendor: str, **kwargs):
+        cp = REGISTRY.upsert(self.id, self)
+        cp.status.last_status = "BootNotification"
+        cp.status.last_error = None
+        cp.status.last_heartbeat_ts = time.time()
+        cp.status.tags.update({"vendor": str(charge_point_vendor), "model": str(charge_point_model)})
+
+        return call_result.BootNotificationPayload(
+            current_time=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            interval=30,
+            status=RegistrationStatus.accepted,
+        )
+
+    @on(Action.Heartbeat)
+    async def on_heartbeat(self):
+        cp = REGISTRY.get(self.id)
+        if cp:
+            cp.status.last_heartbeat_ts = time.time()
+        return call_result.HeartbeatPayload(current_time=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
+
+    @on(Action.StatusNotification)
+    async def on_status_notification(self, connector_id: int, error_code: str, status: str, **kwargs):
+        cp = REGISTRY.get(self.id)
+        if cp:
+            cp.status.last_status = str(status)
+            cp.status.last_error = None if (not error_code or error_code == "NoError") else str(error_code)
+        return call_result.StatusNotificationPayload()
+
+    @on(Action.Authorize)
+    async def on_authorize(self, id_tag: str, **kwargs):
+        return call_result.AuthorizePayload(id_tag_info={"status": AuthorizationStatus.accepted})
+
+    @on(Action.StartTransaction)
+    async def on_start_transaction(self, connector_id: int, id_tag: str, meter_start: int, timestamp: str, **kwargs):
+        cp = REGISTRY.get(self.id)
+        tx_id = int(time.time())
+        if cp:
+            cp.status.active_transaction_id = tx_id
+            cp.status.last_status = "TransactionStarted"
+            cp.status.last_meter.update({"meter_start": meter_start, "timestamp": timestamp})
+        return call_result.StartTransactionPayload(transaction_id=tx_id, id_tag_info={"status": AuthorizationStatus.accepted})
+
+    @on(Action.StopTransaction)
+    async def on_stop_transaction(self, transaction_id: int, meter_stop: int, timestamp: str, **kwargs):
+        cp = REGISTRY.get(self.id)
+        if cp:
+            cp.status.last_status = "TransactionStopped"
+            cp.status.last_meter.update({"meter_stop": meter_stop, "timestamp": timestamp})
+            cp.status.active_transaction_id = None
+        return call_result.StopTransactionPayload(id_tag_info={"status": AuthorizationStatus.accepted})
+
+    @on(Action.MeterValues)
+    async def on_meter_values(self, connector_id: int, meter_value: Any, **kwargs):
+        cp = REGISTRY.get(self.id)
+        if cp:
+            cp.status.last_meter.update({"connector_id": connector_id, "meter_value": meter_value})
+        return call_result.MeterValuesPayload()
+
+    @on(Action.DataTransfer)
+    async def on_data_transfer(self, vendor_id: str, message_id: Optional[str] = None, data: Optional[str] = None, **kwargs):
+        cp = REGISTRY.get(self.id)
+        if cp:
+            cp.status.last_meter.update({"data_transfer": {"vendor_id": vendor_id, "message_id": message_id, "data": data}})
+        return call_result.DataTransferPayload(status="Accepted", data="OK")
+
+    # ---------------- CSMS -> Appliance helpers ----------------
+
+    async def remote_start(self, id_tag: str = "HOME", connector_id: int = 1) -> Dict[str, Any]:
+        req = call.RemoteStartTransactionPayload(id_tag=id_tag, connector_id=connector_id)
+        return await self.call(req)
+
+    async def remote_stop(self, transaction_id: int) -> Dict[str, Any]:
+        req = call.RemoteStopTransactionPayload(transaction_id=transaction_id)
+        return await self.call(req)
+
+    async def set_power_cap_watts(
+        self,
+        limit_watts: float,
+        connector_id: int = 1,
+        transaction_id: Optional[int] = None,
+        duration_seconds: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """
+        Use SetChargingProfile as a generalized power cap for appliances.
+        """
+        charging_schedule: Dict[str, Any] = {
+            "chargingRateUnit": "W",
+            "chargingSchedulePeriod": [{"startPeriod": 0, "limit": float(limit_watts)}],
+        }
+        if duration_seconds is not None:
+            charging_schedule["duration"] = int(duration_seconds)
+
+        profile: Dict[str, Any] = {
+            "chargingProfileId": int(time.time()),
+            "stackLevel": 1,
+            "chargingProfilePurpose": "TxProfile",
+            "chargingProfileKind": "Absolute",
+            "chargingSchedule": charging_schedule,
+        }
+        if transaction_id is not None:
+            profile["transactionId"] = int(transaction_id)
+
+        req = call.SetChargingProfilePayload(connector_id=connector_id, cs_charging_profiles=profile)
+        return await self.call(req)
+
+    async def data_transfer(self, vendor_id: str, message_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        req = call.DataTransferPayload(vendor_id=vendor_id, message_id=message_id, data=json.dumps(payload))
+        return await self.call(req)
+
+    async def load_level_control(
+        self,
+        target_load_kw: float,
+        command: str = "SET",
+        duration_minutes: int = 0,
+        reason: str = "Home Load Management",
+        transaction_id: Optional[int] = None,
+        vendor_id: str = "home.appliance",
+    ) -> Dict[str, Any]:
+        return await self.data_transfer(
+            vendor_id=vendor_id,
+            message_id="LoadLevelControl",
+            payload={
+                "command": command,
+                "targetLoadLevel": target_load_kw,
+                "duration": duration_minutes,
+                "reason": reason,
+                "transactionId": transaction_id,
+            },
+        )
+
+    async def charging_rate_unit_change(
+        self,
+        desired_unit: str,
+        reason: str = "Home Demand Response",
+        effective_time: Optional[str] = None,
+        transaction_id: Optional[int] = None,
+        vendor_id: str = "home.appliance",
+    ) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {"desiredUnit": desired_unit, "reason": reason, "transactionId": transaction_id}
+        if effective_time:
+            payload["effectiveTime"] = effective_time
+
+        return await self.data_transfer(vendor_id=vendor_id, message_id="ChargingRateUnitChange", payload=payload)
+File: app/main.py
+from __future__ import annotations
+
+import logging
+from pathlib import Path
+from typing import Any, Dict, Optional
+
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import HTMLResponse, JSONResponse
+
+from app.csms import ApplianceChargePoint
+from app.models import (
+    ApplianceInfo,
+    ApplianceStatus,
+    RemoteStartRequest,
+    RemoteStopRequest,
+    LoadLevelControlRequest,
+    ChargingRateUnitChangeRequest,
+    SimpleChargingProfile,
+    DataTransferRequest,
+    GroupCreate,
+    GroupUpdate,
+    GroupView,
+    GroupMemberAppliance,
+    GroupMemberGroup,
+    ApplianceLimitUpdate,
+    EffectiveCapsResponse,
+)
+from app.state import REGISTRY
+from app.groups import GROUPS
+from app.dashboard import build_dashboard, effective_caps
+
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("home-ocpp-csms")
+
+BASE_DIR = Path(__file__).resolve().parent
+STATIC_DIR = BASE_DIR / "static"
+
+app = FastAPI(title="Home OCPP Appliance Gateway", version="0.2.0")
+app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+
+class StarletteWebSocketAdapter:
+    """
+    Adapter to satisfy the ocpp library expectation of a connection with:
+      - async recv() -> str
+      - async send(str)
+    """
+    def __init__(self, ws: WebSocket) -> None:
+        self.ws = ws
+
+    async def recv(self) -> str:
+        return await self.ws.receive_text()
+
+    async def send(self, msg: str) -> None:
+        await self.ws.send_text(msg)
+
+
+@app.get("/", response_class=HTMLResponse)
+def ui_home():
+    return (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+
+
+# ---------------------- Appliance APIs ----------------------
+
+@app.get("/api/appliances", response_model=Dict[str, ApplianceStatus])
+def list_appliances() -> Dict[str, ApplianceStatus]:
+    return REGISTRY.list_status()
+
+
+@app.get("/api/appliances/info", response_model=Dict[str, ApplianceInfo])
+def list_appliance_info() -> Dict[str, ApplianceInfo]:
+    return REGISTRY.list_info()
+
+
+def _get_cp_or_404(cp_id: str) -> ApplianceChargePoint:
+    entry = REGISTRY.get(cp_id)
+    if not entry or not entry.status.connected:
+        raise HTTPException(status_code=404, detail=f"{cp_id} not connected")
+    return entry.charge_point
+
+
+@app.patch("/api/appliances/{cp_id}/limit", response_model=ApplianceStatus)
+def set_appliance_limit(cp_id: str, body: ApplianceLimitUpdate):
+    entry = REGISTRY.get(cp_id)
+    if not entry:
+        raise HTTPException(status_code=404, detail="appliance not found")
+    entry.status.individual_limit_watts = body.limit_watts
+    return entry.status
+
+
+@app.post("/api/appliances/{cp_id}/remote_start")
+async def remote_start(cp_id: str, body: RemoteStartRequest) -> Any:
+    entry = REGISTRY.get(cp_id)
+    cp = _get_cp_or_404(cp_id)
+    async with entry.lock:
+        return await cp.remote_start(id_tag=body.id_tag, connector_id=body.connector_id)
+
+
+@app.post("/api/appliances/{cp_id}/remote_stop")
+async def remote_stop(cp_id: str, body: RemoteStopRequest) -> Any:
+    entry = REGISTRY.get(cp_id)
+    cp = _get_cp_or_404(cp_id)
+    async with entry.lock:
+        return await cp.remote_stop(transaction_id=body.transaction_id)
+
+
+@app.post("/api/appliances/{cp_id}/power_cap")
+async def set_power_cap(cp_id: str, body: SimpleChargingProfile) -> Any:
+    if body.unit != "W":
+        raise HTTPException(status_code=400, detail="Only unit=W is supported for appliance caps")
+    entry = REGISTRY.get(cp_id)
+    cp = _get_cp_or_404(cp_id)
+    async with entry.lock:
+        return await cp.set_power_cap_watts(
+            limit_watts=body.limit,
+            connector_id=body.connector_id,
+            transaction_id=body.transaction_id,
+            duration_seconds=body.duration_seconds,
+        )
+
+
+@app.post("/api/appliances/{cp_id}/data_transfer")
+async def send_data_transfer(cp_id: str, body: DataTransferRequest) -> Any:
+    entry = REGISTRY.get(cp_id)
+    cp = _get_cp_or_404(cp_id)
+    async with entry.lock:
+        return await cp.data_transfer(body.vendor_id, body.message_id, body.data)
+
+
+@app.post("/api/appliances/{cp_id}/load_level_control")
+async def send_load_level_control(cp_id: str, body: LoadLevelControlRequest) -> Any:
+    entry = REGISTRY.get(cp_id)
+    cp = _get_cp_or_404(cp_id)
+    async with entry.lock:
+        return await cp.load_level_control(
+            target_load_kw=body.target_load_kw,
+            command=body.command,
+            duration_minutes=body.duration_minutes,
+            reason=body.reason,
+            transaction_id=body.transaction_id,
+        )
+
+
+@app.post("/api/appliances/{cp_id}/charging_rate_unit_change")
+async def send_rate_unit_change(cp_id: str, body: ChargingRateUnitChangeRequest) -> Any:
+    entry = REGISTRY.get(cp_id)
+    cp = _get_cp_or_404(cp_id)
+    async with entry.lock:
+        return await cp.charging_rate_unit_change(
+            desired_unit=body.desired_unit,
+            reason=body.reason,
+            effective_time=body.effective_time,
+            transaction_id=body.transaction_id,
+        )
+
+
+# ---------------------- Group APIs ----------------------
+
+def _group_to_view(g) -> GroupView:
+    return GroupView(
+        group_id=g.group_id,
+        name=g.name,
+        limit_watts=g.limit_watts,
+        appliances=set(g.appliances),
+        subgroups=set(g.subgroups),
+    )
+
+
+@app.get("/api/groups", response_model=Dict[str, GroupView])
+def list_groups():
+    return {gid: _group_to_view(g) for gid, g in GROUPS.list_groups().items()}
+
+
+@app.post("/api/groups", response_model=GroupView)
+def create_group(body: GroupCreate):
+    g = GROUPS.create_group(body.group_id, body.name, body.limit_watts)
+    return _group_to_view(g)
+
+
+@app.patch("/api/groups/{group_id}", response_model=GroupView)
+def update_group(group_id: str, body: GroupUpdate):
+    g = GROUPS.get_group(group_id)
+    if not g:
+        raise HTTPException(status_code=404, detail="group not found")
+    if body.name is not None:
+        g.name = body.name
+    # allow null explicitly
+    g.limit_watts = body.limit_watts
+    return _group_to_view(g)
+
+
+@app.delete("/api/groups/{group_id}")
+def delete_group(group_id: str):
+    GROUPS.delete_group(group_id)
+    return JSONResponse({"ok": True})
+
+
+@app.post("/api/groups/{group_id}/appliances", response_model=GroupView)
+def add_appliance_to_group(group_id: str, body: GroupMemberAppliance):
+    try:
+        g = GROUPS.add_appliance(group_id, body.cp_id)
+        return _group_to_view(g)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.delete("/api/groups/{group_id}/appliances/{cp_id}", response_model=GroupView)
+def remove_appliance_from_group(group_id: str, cp_id: str):
+    try:
+        g = GROUPS.remove_appliance(group_id, cp_id)
+        return _group_to_view(g)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/api/groups/{group_id}/subgroups", response_model=GroupView)
+def add_subgroup(group_id: str, body: GroupMemberGroup):
+    try:
+        g = GROUPS.add_subgroup(group_id, body.child_group_id)
+        return _group_to_view(g)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.delete("/api/groups/{group_id}/subgroups/{child_group_id}", response_model=GroupView)
+def remove_subgroup(group_id: str, child_group_id: str):
+    try:
+        g = GROUPS.remove_subgroup(group_id, child_group_id)
+        return _group_to_view(g)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+# ---------------------- Cap resolution + application ----------------------
+
+@app.get("/api/caps/effective", response_model=EffectiveCapsResponse)
+def api_effective_caps():
+    caps, reasons = effective_caps()
+    return EffectiveCapsResponse(caps=caps, reasons=reasons)
+
+
+@app.post("/api/caps/apply")
+async def apply_effective_caps():
+    """
+    Push effective caps to connected appliances using SetChargingProfile in watts.
+    This assumes appliance controllers interpret SetChargingProfile as a power cap.
+    """
+    caps, _ = effective_caps()
+    results: Dict[str, Any] = {}
+
+    for cp_id, cap in caps.items():
+        entry = REGISTRY.get(cp_id)
+        if not entry or not entry.status.connected:
+            results[cp_id] = {"ok": False, "error": "not connected"}
+            continue
+        if cap is None:
+            results[cp_id] = {"ok": True, "skipped": "no cap"}
+            continue
+        try:
+            async with entry.lock:
+                res = await entry.charge_point.set_power_cap_watts(
+                    limit_watts=float(cap),
+                    connector_id=1,
+                    transaction_id=entry.status.active_transaction_id,
+                    duration_seconds=None,
+                )
+            results[cp_id] = {"ok": True, "response": res}
+        except Exception as e:
+            results[cp_id] = {"ok": False, "error": str(e)}
+
+    return results
+
+
+# ---------------------- Dashboard API ----------------------
+
+@app.get("/api/dashboard")
+def dashboard(service_limit_w: Optional[int] = None):
+    """
+    Returns totals, per-appliance loads, per-group loads, and recent history.
+    Optionally supply service_limit_w to compute headroom.
+    Example: /api/dashboard?service_limit_w=20000
+    """
+    return build_dashboard(service_limit_w=service_limit_w)
+
+
+# ---------------------- OCPP WebSocket endpoint ----------------------
+
+@app.websocket("/ocpp/{cp_id}")
+async def ocpp_ws(websocket: WebSocket, cp_id: str):
+    # Accept subprotocol if the client requests it.
+    # Many OCPP clients will request "ocpp1.6".
+    await websocket.accept(subprotocol="ocpp1.6")
+
+    adapter = StarletteWebSocketAdapter(websocket)
+    cp = ApplianceChargePoint(cp_id, adapter)
+    REGISTRY.upsert(cp_id, cp)
+    await cp.on_connect_init()
+
+    try:
+        await cp.start()
+    except WebSocketDisconnect:
+        log.info("Disconnected: %s", cp_id)
+    except Exception as e:
+        log.exception("OCPP session error for %s: %s", cp_id, e)
+    finally:
+        REGISTRY.mark_disconnected(cp_id)
+        try:
+            await websocket.close()
+        except Exception:
+            pass
+File: app/static/index.html
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Home OCPP Appliance Gateway</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 16px; }
+    h1 { margin: 0 0 8px 0; }
+    .muted { color: #666; font-size: 12px; }
+    .row { display: flex; gap: 18px; flex-wrap: wrap; align-items: flex-start; }
+    .card { border: 1px solid #ddd; border-radius: 10px; padding: 12px; background: #fff; }
+    .card h2 { font-size: 16px; margin: 0 0 10px 0; }
+    table { border-collapse: collapse; width: 100%; }
+    th, td { border-bottom: 1px solid #eee; padding: 6px 4px; vertical-align: top; }
+    th { text-align: left; font-weight: 600; }
+    input[type="number"] { width: 120px; }
+    input[type="text"] { width: 180px; }
+    button { cursor: pointer; }
+    .ok { color: #0a7; }
+    .bad { color: #c33; }
+    .tree { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; white-space: pre; font-size: 12px; }
+    canvas { display: block; }
+    .kpi { font-size: 28px; font-weight: 650; }
+  </style>
+</head>
+<body>
+  <h1>Home OCPP Appliance Gateway</h1>
+  <div class="muted">
+    Manage per-load caps and nested virtual group caps. Dashboard shows live loading derived from last OCPP MeterValues.
+  </div>
+
+  <!-- Dashboard -->
+  <div class="row" style="margin-top: 12px;">
+    <div class="card" style="flex: 1; min-width: 720px;">
+      <h2>Dashboard</h2>
+
+      <div class="row">
+        <div class="card" style="min-width: 220px;">
+          <h2>Total Load</h2>
+          <div class="kpi"><span id="kpiTotalW">—</span> W</div>
+          <div class="muted">Sum of connected appliances (instant W)</div>
+        </div>
+
+        <div class="card" style="min-width: 260px;">
+          <h2>Service Headroom</h2>
+          <div class="kpi"><span id="kpiHeadroom">—</span> W</div>
+          <div class="muted">
+            Service limit (W):
+            <input id="serviceLimitInput" type="number" min="0" placeholder="e.g. 20000" />
+            <button onclick="refreshDashboard()">Set</button>
+          </div>
+        </div>
+
+        <div class="card" style="min-width: 220px;">
+          <h2>Connected</h2>
+          <div class="kpi"><span id="kpiConn">—</span></div>
+          <div class="muted"><span id="kpiKnown">—</span> known</div>
+        </div>
+
+        <div class="card" style="min-width: 220px;">
+          <h2>Auto-refresh</h2>
+          <div class="muted">
+            Interval (ms):
+            <input id="refreshMs" type="number" min="250" value="2000" />
+          </div>
+          <div style="margin-top: 8px;">
+            <button onclick="toggleAutoRefresh()" id="autoBtn">Start</button>
+            <span class="muted" id="autoStatus"></span>
+          </div>
+        </div>
+      </div>
+
+      <div style="margin-top: 10px;">
+        <canvas id="loadChart" width="1000" height="180" style="width:100%; border:1px solid #eee; border-radius:10px;"></canvas>
+        <div class="muted">Recent total load history (in-memory ring buffer).</div>
+      </div>
+
+      <div style="margin-top: 10px;">
+        <button onclick="refreshAll()">Refresh all</button>
+        <button onclick="applyCaps()">Apply effective caps</button>
+        <span class="muted" id="applyResult"></span>
+        <span class="muted" id="dashStatus" style="margin-left: 10px;"></span>
+      </div>
+    </div>
+  </div>
+
+  <div class="row" style="margin-top: 12px;">
+    <!-- Appliances -->
+    <div class="card" style="flex: 1; min-width: 720px;">
+      <h2>Appliances</h2>
+      <table id="appliancesTable">
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>Status</th>
+            <th>Instant (W)</th>
+            <th>Individual cap (W)</th>
+            <th>Groups</th>
+            <th>Effective cap (W)</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+
+    <!-- Groups panel -->
+    <div class="card" style="width: 430px;">
+      <h2>Create group</h2>
+      <div>
+        <div>
+          <label class="muted">Group ID</label><br/>
+          <input id="newGroupId" type="text" placeholder="e.g. whole_home" />
+        </div>
+        <div style="margin-top: 8px;">
+          <label class="muted">Name</label><br/>
+          <input id="newGroupName" type="text" placeholder="e.g. Whole Home" />
+        </div>
+        <div style="margin-top: 8px;">
+          <label class="muted">Limit (W) optional</label><br/>
+          <input id="newGroupLimit" type="number" min="0" placeholder="e.g. 8000" />
+        </div>
+        <div style="margin-top: 10px;">
+          <button onclick="createGroup()">Create</button>
+          <span id="createGroupResult" class="muted"></span>
+        </div>
+      </div>
+
+      <hr style="margin: 12px 0;"/>
+
+      <h2>Groups</h2>
+      <div class="muted">Groups can include appliances and other groups (no cycles).</div>
+      <div id="groupsList" style="margin-top: 10px;"></div>
+
+      <hr style="margin: 12px 0;"/>
+
+      <h2>Group graph</h2>
+      <div class="muted">Roots have no parents. Nested view shows subgroups.</div>
+      <div id="groupTree" class="tree" style="margin-top: 10px;"></div>
+    </div>
+  </div>
+
+  <!-- Group loading table -->
+  <div class="row" style="margin-top: 12px;">
+    <div class="card" style="flex: 1; min-width: 720px;">
+      <h2>Group Loading</h2>
+      <table id="groupsLoadingTable">
+        <thead>
+          <tr>
+            <th>Group</th>
+            <th>Limit (W)</th>
+            <th>Instant (W)</th>
+            <th>Members</th>
+            <th>Connected</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </div>
+
+<script>
+let autoTimer = null;
+
+async function api(path, opts={}) {
+  const res = await fetch(path, opts);
+  if (!res.ok) {
+    const txt = await res.text();
+    throw new Error(`${res.status} ${res.statusText}: ${txt}`);
+  }
+  const ct = res.headers.get('content-type') || '';
+  if (ct.includes('application/json')) return res.json();
+  return res.text();
+}
+
+function wattsOrDash(v) { return (v === null || v === undefined) ? '—' : v; }
+function fmt(n) { return (n === null || n === undefined) ? '—' : Math.round(n).toString(); }
+
+async function refreshAll() {
+  const dashStatus = document.getElementById('dashStatus');
+  dashStatus.textContent = 'Loading...';
+  try {
+    const limStr = document.getElementById('serviceLimitInput').value.trim();
+    const dashQs = limStr ? `?service_limit_w=${encodeURIComponent(limStr)}` : '';
+
+    const [appliances, groups, effective, dash] = await Promise.all([
+      api('/api/appliances'),
+      api('/api/groups'),
+      api('/api/caps/effective'),
+      api(`/api/dashboard${dashQs}`)
+    ]);
+
+    renderAppliances(appliances, groups, effective.caps, dash.appliances);
+    renderGroups(groups);
+    renderTree(groups);
+    renderGroupLoading(dash.groups || {});
+    renderDashboard(dash);
+
+    dashStatus.textContent = 'Updated.';
+  } catch (e) {
+    dashStatus.textContent = e.message;
+  }
+}
+
+function renderAppliances(appliances, groups, effCaps, dashAppliances) {
+  const tbody = document.querySelector('#appliancesTable tbody');
+  tbody.innerHTML = '';
+
+  const groupMembership = {};
+  for (const [gid, g] of Object.entries(groups)) {
+    for (const cp_id of g.appliances) {
+      groupMembership[cp_id] = groupMembership[cp_id] || [];
+      groupMembership[cp_id].push(gid);
+    }
+  }
+
+  const ids = Object.keys(appliances).sort();
+  for (const cp_id of ids) {
+    const st = appliances[cp_id];
+    const instW = dashAppliances && dashAppliances[cp_id] ? dashAppliances[cp_id].instant_w : null;
+
+    const statusTxt = st.connected ? 'connected' : 'offline';
+    const statusClass = st.connected ? 'ok' : 'bad';
+    const groupsTxt = (groupMembership[cp_id] || []).sort().join(', ') || '—';
+    const eff = effCaps[cp_id];
+
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td><b>${cp_id}</b></td>
+      <td class="${statusClass}">${statusTxt}</td>
+      <td><b>${fmt(instW)}</b></td>
+      <td>
+        <input type="number" min="0" value="${st.individual_limit_watts ?? ''}"
+               placeholder="none" data-cp="${cp_id}" />
+        <button data-cp="${cp_id}" data-action="set">Set</button>
+        <button data-cp="${cp_id}" data-action="clear">Clear</button>
+      </td>
+      <td>${groupsTxt}</td>
+      <td><b>${wattsOrDash(eff)}</b></td>
+    `;
+    tbody.appendChild(tr);
+  }
+
+  tbody.querySelectorAll('button').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const cp = btn.getAttribute('data-cp');
+      const action = btn.getAttribute('data-action');
+      const input = tbody.querySelector(`input[data-cp="${cp}"]`);
+      const value = (action === 'clear') ? null : (input.value === '' ? null : parseInt(input.value, 10));
+      await api(`/api/appliances/${cp}/limit`, {
+        method: 'PATCH',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({limit_watts: value}),
+      });
+      await refreshAll();
+    });
+  });
+}
+
+function groupCard(gid, g) {
+  const limitVal = (g.limit_watts === null || g.limit_watts === undefined) ? '' : g.limit_watts;
+  return `
+  <div style="border:1px solid #eee; border-radius:10px; padding:10px; margin-bottom:10px;">
+    <div style="display:flex; justify-content:space-between; align-items:center;">
+      <div>
+        <b>${gid}</b> <span class="muted">(${g.name})</span>
+      </div>
+      <button onclick="deleteGroup('${gid}')">Delete</button>
+    </div>
+
+    <div style="margin-top:8px;">
+      <label class="muted">Group limit (W)</label><br/>
+      <input id="limit_${gid}" type="number" min="0" value="${limitVal}" placeholder="none"/>
+      <button onclick="setGroupLimit('${gid}', false)">Set</button>
+      <button onclick="setGroupLimit('${gid}', true)">Clear</button>
+    </div>
+
+    <div style="margin-top:10px;">
+      <label class="muted">Add appliance to group</label><br/>
+      <input id="addappl_${gid}" type="text" placeholder="cp_id"/>
+      <button onclick="addAppliance('${gid}')">Add</button>
+    </div>
+
+    <div style="margin-top:10px;">
+      <label class="muted">Add subgroup</label><br/>
+      <input id="addsub_${gid}" type="text" placeholder="child_group_id"/>
+      <button onclick="addSubgroup('${gid}')">Add</button>
+    </div>
+
+    <div style="margin-top:10px;">
+      <div class="muted">Appliances:</div>
+      <div>${(g.appliances || []).length ? (g.appliances || []).map(cp => `
+        <div>${cp} <button onclick="removeAppliance('${gid}','${cp}')">Remove</button></div>`
+      ).join('') : '<span class="muted">none</span>'}
+      </div>
+    </div>
+
+    <div style="margin-top:10px;">
+      <div class="muted">Subgroups:</div>
+      <div>${(g.subgroups || []).length ? (g.subgroups || []).map(cg => `
+        <div>${cg} <button onclick="removeSubgroup('${gid}','${cg}')">Remove</button></div>`
+      ).join('') : '<span class="muted">none</span>'}
+      </div>
+    </div>
+  </div>`;
+}
+
+function renderGroups(groups) {
+  const container = document.getElementById('groupsList');
+  const ids = Object.keys(groups).sort();
+  container.innerHTML = ids.length ? ids.map(gid => groupCard(gid, groups[gid])).join('') : '<span class="muted">No groups yet.</span>';
+}
+
+function renderTree(groups) {
+  // Build parent map
+  const parents = {};
+  for (const [gid, g] of Object.entries(groups)) {
+    for (const child of (g.subgroups || [])) {
+      parents[child] = parents[child] || new Set();
+      parents[child].add(gid);
+    }
+  }
+  const roots = Object.keys(groups).filter(gid => !(gid in parents)).sort();
+
+  function walk(gid, prefix) {
+    const g = groups[gid];
+    const limit = (g.limit_watts === null || g.limit_watts === undefined) ? '—' : g.limit_watts;
+    let s = `${prefix}${gid} [limit=${limit}] (${g.name})\n`;
+    const subs = (g.subgroups || []).slice().sort();
+    for (let i = 0; i < subs.length; i++) {
+      const last = i === subs.length - 1;
+      const branch = last ? '└─ ' : '├─ ';
+      s += walk(subs[i], prefix + branch);
+    }
+    return s;
+  }
+
+  let out = '';
+  if (!roots.length) out = '(no root groups; you may have only subgroups)';
+  else for (const r of roots) out += walk(r, '');
+  document.getElementById('groupTree').textContent = out;
+}
+
+async function createGroup() {
+  const gid = document.getElementById('newGroupId').value.trim();
+  const name = document.getElementById('newGroupName').value.trim();
+  const lim = document.getElementById('newGroupLimit').value.trim();
+  const limit_watts = lim === '' ? null : parseInt(lim, 10);
+
+  const el = document.getElementById('createGroupResult');
+  el.textContent = '';
+  try {
+    await api('/api/groups', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({group_id: gid, name, limit_watts})
+    });
+    el.textContent = 'Created.';
+    await refreshAll();
+  } catch (e) {
+    el.textContent = e.message;
+  }
+}
+
+async function deleteGroup(gid) {
+  await api(`/api/groups/${gid}`, {method:'DELETE'});
+  await refreshAll();
+}
+
+async function setGroupLimit(gid, clear) {
+  const input = document.getElementById(`limit_${gid}`);
+  const value = clear ? null : (input.value.trim() === '' ? null : parseInt(input.value, 10));
+  await api(`/api/groups/${gid}`, {
+    method:'PATCH',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({limit_watts: value})
+  });
+  await refreshAll();
+}
+
+async function addAppliance(gid) {
+  const cp_id = document.getElementById(`addappl_${gid}`).value.trim();
+  await api(`/api/groups/${gid}/appliances`, {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({cp_id})
+  });
+  await refreshAll();
+}
+
+async function removeAppliance(gid, cp_id) {
+  await api(`/api/groups/${gid}/appliances/${cp_id}`, {method:'DELETE'});
+  await refreshAll();
+}
+
+async function addSubgroup(gid) {
+  const child_group_id = document.getElementById(`addsub_${gid}`).value.trim();
+  await api(`/api/groups/${gid}/subgroups`, {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({child_group_id})
+  });
+  await refreshAll();
+}
+
+async function removeSubgroup(gid, child) {
+  await api(`/api/groups/${gid}/subgroups/${child}`, {method:'DELETE'});
+  await refreshAll();
+}
+
+async function applyCaps() {
+  const el = document.getElementById('applyResult');
+  el.textContent = 'Applying...';
+  try {
+    const res = await api('/api/caps/apply', {method:'POST'});
+    const okCount = Object.values(res).filter(x => x.ok).length;
+    const total = Object.keys(res).length;
+    el.textContent = `Applied: ${okCount}/${total}.`;
+    await refreshAll();
+  } catch (e) {
+    el.textContent = e.message;
+  }
+}
+
+function renderDashboard(d) {
+  const totals = d.totals || {};
+  document.getElementById('kpiTotalW').textContent = fmt(totals.total_instant_w);
+  document.getElementById('kpiConn').textContent = fmt(totals.connected_appliances);
+  document.getElementById('kpiKnown').textContent = fmt(totals.known_appliances);
+  document.getElementById('kpiHeadroom').textContent = fmt(totals.headroom_w);
+  drawLoadChart(d.history || []);
+}
+
+async function refreshDashboard() {
+  await refreshAll();
+}
+
+function drawLoadChart(points) {
+  const canvas = document.getElementById('loadChart');
+  const ctx = canvas.getContext('2d');
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  if (!points.length) {
+    ctx.fillStyle = '#444';
+    ctx.font = '12px system-ui';
+    ctx.fillText('No data yet.', 10, 20);
+    return;
+  }
+
+  const xs = points.map(p => p.t);
+  const ys = points.map(p => p.total_w);
+
+  const minX = Math.min(...xs);
+  const maxX = Math.max(...xs);
+  const minY = 0;
+  const maxY = Math.max(1000, Math.max(...ys));
+
+  const padL = 45, padR = 10, padT = 10, padB = 25;
+  const W = canvas.width, H = canvas.height;
+
+  function xMap(x) {
+    if (maxX === minX) return padL;
+    return padL + (x - minX) * (W - padL - padR) / (maxX - minX);
+  }
+  function yMap(y) {
+    return padT + (maxY - y) * (H - padT - padB) / (maxY - minY);
+  }
+
+  // axes
+  ctx.strokeStyle = '#bbb';
+  ctx.beginPath();
+  ctx.moveTo(padL, padT);
+  ctx.lineTo(padL, H - padB);
+  ctx.lineTo(W - padR, H - padB);
+  ctx.stroke();
+
+  // labels
+  ctx.fillStyle = '#444';
+  ctx.font = '12px system-ui';
+  ctx.fillText(`${Math.round(maxY)} W`, 6, padT + 10);
+  ctx.fillText(`0 W`, 18, H - padB + 2);
+
+  // line
+  ctx.strokeStyle = '#111';
+  ctx.beginPath();
+  for (let i = 0; i < points.length; i++) {
+    const px = xMap(points[i].t);
+    const py = yMap(points[i].total_w);
+    if (i === 0) ctx.moveTo(px, py);
+    else ctx.lineTo(px, py);
+  }
+  ctx.stroke();
+
+  const last = points[points.length - 1];
+  ctx.fillStyle = '#111';
+  ctx.fillText(`Now: ${Math.round(last.total_w)} W`, W - 155, padT + 12);
+}
+
+function renderGroupLoading(groups) {
+  const tbody = document.querySelector('#groupsLoadingTable tbody');
+  tbody.innerHTML = '';
+
+  const ids = Object.keys(groups).sort();
+  for (const gid of ids) {
+    const g = groups[gid];
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td><b>${gid}</b><div class="muted">${g.name || ''}</div></td>
+      <td>${wattsOrDash(g.limit_watts)}</td>
+      <td><b>${fmt(g.instant_w_sum)}</b></td>
+      <td>${fmt(g.appliances_total)}</td>
+      <td>${fmt(g.appliances_connected)}</td>
+    `;
+    tbody.appendChild(tr);
+  }
+}
+
+function toggleAutoRefresh() {
+  const btn = document.getElementById('autoBtn');
+  const status = document.getElementById('autoStatus');
+  const ms = parseInt(document.getElementById('refreshMs').value, 10);
+
+  if (autoTimer) {
+    clearInterval(autoTimer);
+    autoTimer = null;
+    btn.textContent = 'Start';
+    status.textContent = 'stopped';
+    return;
+  }
+  autoTimer = setInterval(refreshAll, Math.max(250, isNaN(ms) ? 2000 : ms));
+  btn.textContent = 'Stop';
+  status.textContent = 'running';
+}
+
+refreshAll();
+</script>
+</body>
+</html>
+How appliance controllers should interpret caps
+
+This server sends caps via OCPP SetChargingProfile:
+
+chargingRateUnit = "W"
+
+limit = <watts>
+
+Appliance controller behavior should be appliance-specific:
+
+EVSE: set max charging power/current
+
+Water heater: throttle if possible; otherwise schedule/disable element with minimum cycle rules
+
+Dryer: prefer delaying start; shed only when necessary
+
+HVAC: avoid hard power cuts; enforce min off-time; adjust setpoints/duty cycles when possible
+
+Range/oven: usually “non-flexible”; instead treat it as a trigger that forces other loads down
+
+If you need richer semantics, this server supports custom controls via DataTransfer:
+
+LoadLevelControl
+
+ChargingRateUnitChange
+
+What this server is trying to solve (summary)
+
+Unified control plane for multiple high-power home loads
+
+Single policy layer (caps + groups) instead of many vendor apps
+
+Composable constraints using nested groups:
+
+“Whole home” contains “HVAC” and “Laundry,” each with their own caps
+
+Visibility into loading using OCPP metering:
+
+per-load watts, per-group watts, and total watts
+
+A practical stepping stone
+
+Model B retrofit controllers today, Model A embedded OEM OCPP later
+
+Next upgrades (optional)
+
+Persistence (SQLite) for groups, limits, and history
+
+TLS (WSS) termination via Caddy/Nginx (and optionally mTLS)
+
+Auto-enforcement loop (apply caps periodically only when changed)
+
+Integration with panel metering (treat as truth for total load)
+
+Allocation solver (fair-share) instead of simple min() policy if desired
