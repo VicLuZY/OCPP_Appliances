@@ -1,0 +1,14 @@
+[project]
+name = "home-ocpp-appliances"
+version = "0.2.0"
+description = "Home OCPP CSMS for managing appliances with limits, nested groups, and load dashboard"
+requires-python = ">=3.10"
+dependencies = [
+  "fastapi>=0.110",
+  "uvicorn[standard]>=0.27",
+  "ocpp>=0.26.0",
+  "pydantic>=2.5",
+]
+
+[tool.uvicorn]
+factory = false

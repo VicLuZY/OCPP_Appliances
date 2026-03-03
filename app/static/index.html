@@ -1,0 +1,538 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Home OCPP Appliance Gateway</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 16px; }
+    h1 { margin: 0 0 8px 0; }
+    .muted { color: #666; font-size: 12px; }
+    .row { display: flex; gap: 18px; flex-wrap: wrap; align-items: flex-start; }
+    .card { border: 1px solid #ddd; border-radius: 10px; padding: 12px; background: #fff; }
+    .card h2 { font-size: 16px; margin: 0 0 10px 0; }
+    table { border-collapse: collapse; width: 100%; }
+    th, td { border-bottom: 1px solid #eee; padding: 6px 4px; vertical-align: top; }
+    th { text-align: left; font-weight: 600; }
+    input[type="number"] { width: 120px; }
+    input[type="text"] { width: 180px; }
+    button { cursor: pointer; }
+    .ok { color: #0a7; }
+    .bad { color: #c33; }
+    .tree { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; white-space: pre; font-size: 12px; }
+    canvas { display: block; }
+    .kpi { font-size: 28px; font-weight: 650; }
+  </style>
+</head>
+<body>
+  <h1>Home OCPP Appliance Gateway</h1>
+  <div class="muted">
+    Manage per-load caps and nested virtual group caps. Dashboard shows live loading derived from last OCPP MeterValues.
+  </div>
+
+  <!-- Dashboard -->
+  <div class="row" style="margin-top: 12px;">
+    <div class="card" style="flex: 1; min-width: 720px;">
+      <h2>Dashboard</h2>
+
+      <div class="row">
+        <div class="card" style="min-width: 220px;">
+          <h2>Total Load</h2>
+          <div class="kpi"><span id="kpiTotalW">—</span> W</div>
+          <div class="muted">Sum of connected appliances (instant W)</div>
+        </div>
+
+        <div class="card" style="min-width: 260px;">
+          <h2>Service Headroom</h2>
+          <div class="kpi"><span id="kpiHeadroom">—</span> W</div>
+          <div class="muted">
+            Service limit (W):
+            <input id="serviceLimitInput" type="number" min="0" placeholder="e.g. 20000" />
+            <button onclick="refreshDashboard()">Set</button>
+          </div>
+        </div>
+
+        <div class="card" style="min-width: 220px;">
+          <h2>Connected</h2>
+          <div class="kpi"><span id="kpiConn">—</span></div>
+          <div class="muted"><span id="kpiKnown">—</span> known</div>
+        </div>
+
+        <div class="card" style="min-width: 220px;">
+          <h2>Auto-refresh</h2>
+          <div class="muted">
+            Interval (ms):
+            <input id="refreshMs" type="number" min="250" value="2000" />
+          </div>
+          <div style="margin-top: 8px;">
+            <button onclick="toggleAutoRefresh()" id="autoBtn">Start</button>
+            <span class="muted" id="autoStatus"></span>
+          </div>
+        </div>
+      </div>
+
+      <div style="margin-top: 10px;">
+        <canvas id="loadChart" width="1000" height="180" style="width:100%; border:1px solid #eee; border-radius:10px;"></canvas>
+        <div class="muted">Recent total load history (in-memory ring buffer).</div>
+      </div>
+
+      <div style="margin-top: 10px;">
+        <button onclick="refreshAll()">Refresh all</button>
+        <button onclick="applyCaps()">Apply effective caps</button>
+        <span class="muted" id="applyResult"></span>
+        <span class="muted" id="dashStatus" style="margin-left: 10px;"></span>
+      </div>
+    </div>
+  </div>
+
+  <div class="row" style="margin-top: 12px;">
+    <!-- Appliances -->
+    <div class="card" style="flex: 1; min-width: 720px;">
+      <h2>Appliances</h2>
+      <table id="appliancesTable">
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>Status</th>
+            <th>Instant (W)</th>
+            <th>Individual cap (W)</th>
+            <th>Groups</th>
+            <th>Effective cap (W)</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+
+    <!-- Groups panel -->
+    <div class="card" style="width: 430px;">
+      <h2>Create group</h2>
+      <div>
+        <div>
+          <label class="muted">Group ID</label><br/>
+          <input id="newGroupId" type="text" placeholder="e.g. whole_home" />
+        </div>
+        <div style="margin-top: 8px;">
+          <label class="muted">Name</label><br/>
+          <input id="newGroupName" type="text" placeholder="e.g. Whole Home" />
+        </div>
+        <div style="margin-top: 8px;">
+          <label class="muted">Limit (W) optional</label><br/>
+          <input id="newGroupLimit" type="number" min="0" placeholder="e.g. 8000" />
+        </div>
+        <div style="margin-top: 10px;">
+          <button onclick="createGroup()">Create</button>
+          <span id="createGroupResult" class="muted"></span>
+        </div>
+      </div>
+
+      <hr style="margin: 12px 0;"/>
+
+      <h2>Groups</h2>
+      <div class="muted">Groups can include appliances and other groups (no cycles).</div>
+      <div id="groupsList" style="margin-top: 10px;"></div>
+
+      <hr style="margin: 12px 0;"/>
+
+      <h2>Group graph</h2>
+      <div class="muted">Roots have no parents. Nested view shows subgroups.</div>
+      <div id="groupTree" class="tree" style="margin-top: 10px;"></div>
+    </div>
+  </div>
+
+  <!-- Group loading table -->
+  <div class="row" style="margin-top: 12px;">
+    <div class="card" style="flex: 1; min-width: 720px;">
+      <h2>Group Loading</h2>
+      <table id="groupsLoadingTable">
+        <thead>
+          <tr>
+            <th>Group</th>
+            <th>Limit (W)</th>
+            <th>Instant (W)</th>
+            <th>Members</th>
+            <th>Connected</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </div>
+
+<script>
+let autoTimer = null;
+
+async function api(path, opts={}) {
+  const res = await fetch(path, opts);
+  if (!res.ok) {
+    const txt = await res.text();
+    throw new Error(`${res.status} ${res.statusText}: ${txt}`);
+  }
+  const ct = res.headers.get('content-type') || '';
+  if (ct.includes('application/json')) return res.json();
+  return res.text();
+}
+
+function wattsOrDash(v) { return (v === null || v === undefined) ? '—' : v; }
+function fmt(n) { return (n === null || n === undefined) ? '—' : Math.round(n).toString(); }
+
+async function refreshAll() {
+  const dashStatus = document.getElementById('dashStatus');
+  dashStatus.textContent = 'Loading...';
+  try {
+    const limStr = document.getElementById('serviceLimitInput').value.trim();
+    const dashQs = limStr ? `?service_limit_w=${encodeURIComponent(limStr)}` : '';
+
+    const [appliances, groups, effective, dash] = await Promise.all([
+      api('/api/appliances'),
+      api('/api/groups'),
+      api('/api/caps/effective'),
+      api(`/api/dashboard${dashQs}`)
+    ]);
+
+    renderAppliances(appliances, groups, effective.caps, dash.appliances);
+    renderGroups(groups);
+    renderTree(groups);
+    renderGroupLoading(dash.groups || {});
+    renderDashboard(dash);
+
+    dashStatus.textContent = 'Updated.';
+  } catch (e) {
+    dashStatus.textContent = e.message;
+  }
+}
+
+function renderAppliances(appliances, groups, effCaps, dashAppliances) {
+  const tbody = document.querySelector('#appliancesTable tbody');
+  tbody.innerHTML = '';
+
+  const groupMembership = {};
+  for (const [gid, g] of Object.entries(groups)) {
+    for (const cp_id of g.appliances) {
+      groupMembership[cp_id] = groupMembership[cp_id] || [];
+      groupMembership[cp_id].push(gid);
+    }
+  }
+
+  const ids = Object.keys(appliances).sort();
+  for (const cp_id of ids) {
+    const st = appliances[cp_id];
+    const instW = dashAppliances && dashAppliances[cp_id] ? dashAppliances[cp_id].instant_w : null;
+
+    const statusTxt = st.connected ? 'connected' : 'offline';
+    const statusClass = st.connected ? 'ok' : 'bad';
+    const groupsTxt = (groupMembership[cp_id] || []).sort().join(', ') || '—';
+    const eff = effCaps[cp_id];
+
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td><b>${cp_id}</b></td>
+      <td class="${statusClass}">${statusTxt}</td>
+      <td><b>${fmt(instW)}</b></td>
+      <td>
+        <input type="number" min="0" value="${st.individual_limit_watts ?? ''}"
+               placeholder="none" data-cp="${cp_id}" />
+        <button data-cp="${cp_id}" data-action="set">Set</button>
+        <button data-cp="${cp_id}" data-action="clear">Clear</button>
+      </td>
+      <td>${groupsTxt}</td>
+      <td><b>${wattsOrDash(eff)}</b></td>
+    `;
+    tbody.appendChild(tr);
+  }
+
+  tbody.querySelectorAll('button').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const cp = btn.getAttribute('data-cp');
+      const action = btn.getAttribute('data-action');
+      const input = tbody.querySelector(`input[data-cp="${cp}"]`);
+      const value = (action === 'clear') ? null : (input.value === '' ? null : parseInt(input.value, 10));
+      await api(`/api/appliances/${cp}/limit`, {
+        method: 'PATCH',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({limit_watts: value}),
+      });
+      await refreshAll();
+    });
+  });
+}
+
+function groupCard(gid, g) {
+  const limitVal = (g.limit_watts === null || g.limit_watts === undefined) ? '' : g.limit_watts;
+  return `
+  <div style="border:1px solid #eee; border-radius:10px; padding:10px; margin-bottom:10px;">
+    <div style="display:flex; justify-content:space-between; align-items:center;">
+      <div>
+        <b>${gid}</b> <span class="muted">(${g.name})</span>
+      </div>
+      <button onclick="deleteGroup('${gid}')">Delete</button>
+    </div>
+
+    <div style="margin-top:8px;">
+      <label class="muted">Group limit (W)</label><br/>
+      <input id="limit_${gid}" type="number" min="0" value="${limitVal}" placeholder="none"/>
+      <button onclick="setGroupLimit('${gid}', false)">Set</button>
+      <button onclick="setGroupLimit('${gid}', true)">Clear</button>
+    </div>
+
+    <div style="margin-top:10px;">
+      <label class="muted">Add appliance to group</label><br/>
+      <input id="addappl_${gid}" type="text" placeholder="cp_id"/>
+      <button onclick="addAppliance('${gid}')">Add</button>
+    </div>
+
+    <div style="margin-top:10px;">
+      <label class="muted">Add subgroup</label><br/>
+      <input id="addsub_${gid}" type="text" placeholder="child_group_id"/>
+      <button onclick="addSubgroup('${gid}')">Add</button>
+    </div>
+
+    <div style="margin-top:10px;">
+      <div class="muted">Appliances:</div>
+      <div>${(g.appliances || []).length ? (g.appliances || []).map(cp => `
+        <div>${cp} <button onclick="removeAppliance('${gid}','${cp}')">Remove</button></div>`
+      ).join('') : '<span class="muted">none</span>'}
+      </div>
+    </div>
+
+    <div style="margin-top:10px;">
+      <div class="muted">Subgroups:</div>
+      <div>${(g.subgroups || []).length ? (g.subgroups || []).map(cg => `
+        <div>${cg} <button onclick="removeSubgroup('${gid}','${cg}')">Remove</button></div>`
+      ).join('') : '<span class="muted">none</span>'}
+      </div>
+    </div>
+  </div>`;
+}
+
+function renderGroups(groups) {
+  const container = document.getElementById('groupsList');
+  const ids = Object.keys(groups).sort();
+  container.innerHTML = ids.length ? ids.map(gid => groupCard(gid, groups[gid])).join('') : '<span class="muted">No groups yet.</span>';
+}
+
+function renderTree(groups) {
+  // Build parent map
+  const parents = {};
+  for (const [gid, g] of Object.entries(groups)) {
+    for (const child of (g.subgroups || [])) {
+      parents[child] = parents[child] || new Set();
+      parents[child].add(gid);
+    }
+  }
+  const roots = Object.keys(groups).filter(gid => !(gid in parents)).sort();
+
+  function walk(gid, prefix) {
+    const g = groups[gid];
+    const limit = (g.limit_watts === null || g.limit_watts === undefined) ? '—' : g.limit_watts;
+    let s = `${prefix}${gid} [limit=${limit}] (${g.name})\n`;
+    const subs = (g.subgroups || []).slice().sort();
+    for (let i = 0; i < subs.length; i++) {
+      const last = i === subs.length - 1;
+      const branch = last ? '└─ ' : '├─ ';
+      s += walk(subs[i], prefix + branch);
+    }
+    return s;
+  }
+
+  let out = '';
+  if (!roots.length) out = '(no root groups; you may have only subgroups)';
+  else for (const r of roots) out += walk(r, '');
+  document.getElementById('groupTree').textContent = out;
+}
+
+async function createGroup() {
+  const gid = document.getElementById('newGroupId').value.trim();
+  const name = document.getElementById('newGroupName').value.trim();
+  const lim = document.getElementById('newGroupLimit').value.trim();
+  const limit_watts = lim === '' ? null : parseInt(lim, 10);
+
+  const el = document.getElementById('createGroupResult');
+  el.textContent = '';
+  try {
+    await api('/api/groups', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({group_id: gid, name, limit_watts})
+    });
+    el.textContent = 'Created.';
+    await refreshAll();
+  } catch (e) {
+    el.textContent = e.message;
+  }
+}
+
+async function deleteGroup(gid) {
+  await api(`/api/groups/${gid}`, {method:'DELETE'});
+  await refreshAll();
+}
+
+async function setGroupLimit(gid, clear) {
+  const input = document.getElementById(`limit_${gid}`);
+  const value = clear ? null : (input.value.trim() === '' ? null : parseInt(input.value, 10));
+  await api(`/api/groups/${gid}`, {
+    method:'PATCH',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({limit_watts: value})
+  });
+  await refreshAll();
+}
+
+async function addAppliance(gid) {
+  const cp_id = document.getElementById(`addappl_${gid}`).value.trim();
+  await api(`/api/groups/${gid}/appliances`, {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({cp_id})
+  });
+  await refreshAll();
+}
+
+async function removeAppliance(gid, cp_id) {
+  await api(`/api/groups/${gid}/appliances/${cp_id}`, {method:'DELETE'});
+  await refreshAll();
+}
+
+async function addSubgroup(gid) {
+  const child_group_id = document.getElementById(`addsub_${gid}`).value.trim();
+  await api(`/api/groups/${gid}/subgroups`, {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({child_group_id})
+  });
+  await refreshAll();
+}
+
+async function removeSubgroup(gid, child) {
+  await api(`/api/groups/${gid}/subgroups/${child}`, {method:'DELETE'});
+  await refreshAll();
+}
+
+async function applyCaps() {
+  const el = document.getElementById('applyResult');
+  el.textContent = 'Applying...';
+  try {
+    const res = await api('/api/caps/apply', {method:'POST'});
+    const okCount = Object.values(res).filter(x => x.ok).length;
+    const total = Object.keys(res).length;
+    el.textContent = `Applied: ${okCount}/${total}.`;
+    await refreshAll();
+  } catch (e) {
+    el.textContent = e.message;
+  }
+}
+
+function renderDashboard(d) {
+  const totals = d.totals || {};
+  document.getElementById('kpiTotalW').textContent = fmt(totals.total_instant_w);
+  document.getElementById('kpiConn').textContent = fmt(totals.connected_appliances);
+  document.getElementById('kpiKnown').textContent = fmt(totals.known_appliances);
+  document.getElementById('kpiHeadroom').textContent = fmt(totals.headroom_w);
+  drawLoadChart(d.history || []);
+}
+
+async function refreshDashboard() {
+  await refreshAll();
+}
+
+function drawLoadChart(points) {
+  const canvas = document.getElementById('loadChart');
+  const ctx = canvas.getContext('2d');
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  if (!points.length) {
+    ctx.fillStyle = '#444';
+    ctx.font = '12px system-ui';
+    ctx.fillText('No data yet.', 10, 20);
+    return;
+  }
+
+  const xs = points.map(p => p.t);
+  const ys = points.map(p => p.total_w);
+
+  const minX = Math.min(...xs);
+  const maxX = Math.max(...xs);
+  const minY = 0;
+  const maxY = Math.max(1000, Math.max(...ys));
+
+  const padL = 45, padR = 10, padT = 10, padB = 25;
+  const W = canvas.width, H = canvas.height;
+
+  function xMap(x) {
+    if (maxX === minX) return padL;
+    return padL + (x - minX) * (W - padL - padR) / (maxX - minX);
+  }
+  function yMap(y) {
+    return padT + (maxY - y) * (H - padT - padB) / (maxY - minY);
+  }
+
+  // axes
+  ctx.strokeStyle = '#bbb';
+  ctx.beginPath();
+  ctx.moveTo(padL, padT);
+  ctx.lineTo(padL, H - padB);
+  ctx.lineTo(W - padR, H - padB);
+  ctx.stroke();
+
+  // labels
+  ctx.fillStyle = '#444';
+  ctx.font = '12px system-ui';
+  ctx.fillText(`${Math.round(maxY)} W`, 6, padT + 10);
+  ctx.fillText(`0 W`, 18, H - padB + 2);
+
+  // line
+  ctx.strokeStyle = '#111';
+  ctx.beginPath();
+  for (let i = 0; i < points.length; i++) {
+    const px = xMap(points[i].t);
+    const py = yMap(points[i].total_w);
+    if (i === 0) ctx.moveTo(px, py);
+    else ctx.lineTo(px, py);
+  }
+  ctx.stroke();
+
+  const last = points[points.length - 1];
+  ctx.fillStyle = '#111';
+  ctx.fillText(`Now: ${Math.round(last.total_w)} W`, W - 155, padT + 12);
+}
+
+function renderGroupLoading(groups) {
+  const tbody = document.querySelector('#groupsLoadingTable tbody');
+  tbody.innerHTML = '';
+
+  const ids = Object.keys(groups).sort();
+  for (const gid of ids) {
+    const g = groups[gid];
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td><b>${gid}</b><div class="muted">${g.name || ''}</div></td>
+      <td>${wattsOrDash(g.limit_watts)}</td>
+      <td><b>${fmt(g.instant_w_sum)}</b></td>
+      <td>${fmt(g.appliances_total)}</td>
+      <td>${fmt(g.appliances_connected)}</td>
+    `;
+    tbody.appendChild(tr);
+  }
+}
+
+function toggleAutoRefresh() {
+  const btn = document.getElementById('autoBtn');
+  const status = document.getElementById('autoStatus');
+  const ms = parseInt(document.getElementById('refreshMs').value, 10);
+
+  if (autoTimer) {
+    clearInterval(autoTimer);
+    autoTimer = null;
+    btn.textContent = 'Start';
+    status.textContent = 'stopped';
+    return;
+  }
+  autoTimer = setInterval(refreshAll, Math.max(250, isNaN(ms) ? 2000 : ms));
+  btn.textContent = 'Stop';
+  status.textContent = 'running';
+}
+
+refreshAll();
+</script>
+</body>
+</html>
